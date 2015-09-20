@@ -70,7 +70,7 @@ maxStepsClockTime = paste(floor(maxStepsInterval/100),maxStepsInterval%%100,sep=
 maxStepsDate = dfActivity[which.max(dfActivity$steps), "date"]
 maxStepsDay = weekdays(maxStepsDate)
 ```
-5 minute interval of maximum avarage activity (206.2 steps) occurs at 8:35.
+The 5-minute interval of maximum average (over all days) activity (206.2 steps) occurs at 8:35.
 Interestingly, the overall maximum number of steps is 806 which occurs at 6:15 on 2012-11-27, which is a Tuesday.
 
 ## Imputing missing values
@@ -132,38 +132,32 @@ The second approach is to replace NA values with 0. Using 0-replacement, we find
 #plot them side-by-side
 par("mfrow" = c(1,3))
 hist(dfActivityStepsByDay$steps, breaks = 20, col = "lightBlue", plot = T, ylim = c(0,20),
-     xlab="Number of steps", ylab="Frequency", main="Histogram of mean daily steps, \nwith mean, \nNAs excluded")
-abline(v = meanStepsByDay, col = "darkRed")
+     xlab="Number of steps", ylab="Frequency", main="Histogram of mean daily steps, \nwith mean (orange)\n& median (dark red), \nNAs excluded")
+abline(v = meanStepsByDay, col = "orange", lwd = 5)
+abline(v = medianStepsByDay, col = "darkRed")
 hist(dfCleanActivityStepsByDay$steps, breaks = 20, col = "lightBlue", plot = T, ylim = c(0,20),
-     xlab="Number of steps", ylab="Frequency", main="Histogram of mean daily steps \n with mean; \nNA values replaced \nby interval mean")
-abline(v = cleanMeanStepsByDay, col = "darkRed")
+     xlab="Number of steps", ylab="Frequency",
+     main="Histogram of mean daily steps \n with mean & median; \nNA values replaced \nby interval mean")
+abline(v = cleanMeanStepsByDay, col = "orange", lwd = 5)
+abline(v = cleanMedianStepsByDay, col = "darkRed")
 hist(dfCleanActivitySteps0ByDay$steps0, breaks = 20, col = "lightBlue", plot = T, ylim = c(0,20),
-     xlab="Number of steps", ylab="Frequency", main="Histogram of mean daily steps \n with mean; \nNA values replaced \nby 0")
-abline(v = cleanMeanSteps0ByDay, col = "darkRed")
+     xlab="Number of steps", ylab="Frequency", main="Histogram of mean daily steps \n with mean & median; \nNA values replaced \nby 0")
+abline(v = cleanMeanSteps0ByDay, col = "orange", lwd = 5)
+abline(v = cleanMedianSteps0ByDay, col = "darkRed")
 ```
 
 ![](./figures/plotClean-1.png) 
 
 As can be seen, there are more days reported in the 10000 step bin when we impute from interval means, but the mean number of steps per day is unchanged little from 10766.2 to 10766.2 in the cleaned data. The median steps per day are little changed, from 10765 to 10766.2 for the interval-mean imputed data.
 
-When we use 0-replacement for NA values, we get a noticably different mean steps value of 9354.23 and a median of 10395. In this case, it appears that all of the additional 10000 step days now fall into 0-step days. This appears to be a systematic pattern of NA values and invites further investigation.
+When we use 0-replacement for NA values, we get a noticably different mean steps value of 9354.23 and a median of 10395. In this case, it appears that many of the NA intervals contributed to additional 10000 step days, Using 0-replacement strategy, these now fall into 0-step days. This appears to be a systematic pattern of NA values and invites further investigation.
 
 ## Are there differences in activity patterns between weekdays and weekends?
 
 ```r
 dfCleanActivity$weekdays <- ifelse(weekdays(dfCleanActivity$date) %in% c("Saturday", "Sunday"), "weekend", "weekday")
 dfCleanActivity$weekdays <- factor(dfCleanActivity$weekdays)
-library(ggplot2)
-q <- qplot(interval, steps, data = dfCleanActivity, stat = "summary", geom = "line",
-           fun.y = mean, facets = weekdays ~ ., 
-           xlab = "Time of interval (24 hour clock)", ylab = "Average steps per interval",
-           main = "Comparison of weekday and weekend activity")
-print(q)
-```
 
-![](./figures/weekdayWeekendPatterns-1.png) 
-
-```r
 dfWeekActivity = split(dfCleanActivity, dfCleanActivity$weekdays)
 dfWeekdayActivityByInterval = aggregate(dfWeekActivity[[1]]$steps, 
                                         by = list(dfWeekActivity[[1]]$interval), mean)
@@ -197,5 +191,19 @@ meanWeekendPmSteps =
                                 dfWeekendActivityByInterval$interval <= 1700,
                               "steps"]),4)
 meanWeekendActivity = signif(mean(dfWeekendActivityByInterval[,"steps"]),4)
+
+library(ggplot2)
+q <- qplot(interval, steps, data = dfCleanActivity, stat = "summary", geom = "line",
+           fun.y = mean, facets = weekdays ~ ., 
+           xlab = "Time of interval (24 hour clock)", ylab = "Average steps per interval",
+           main = "Comparison of weekday and weekend activity, with means")
+
+
+dfHlines = data.frame(z = c(meanWeekdayActivity, meanWeekendActivity), weekdays = levels(dfCleanActivity$weekdays))
+q = q + geom_hline(aes(yintercept = z), data = dfHlines)
+print(q)
 ```
-There appears to be a higher peak of activity (230.4 steps) in weekday mid-mornings, at 8:35, while the weekend peak is lower (166.6 steps) and occurs later, at 9:15. However, the weekend pattern shows more consistent activity in the afternoon hours, with 83.87 mean weekend afternoon activity but only 39.8 mean afternoon activity on weekdays. Indeed, there is a higher mean level of activity on the weekend: 42.37 steps compared to the weekday mean of 35.61 steps.
+
+![](./figures/weekdayWeekendPatterns-1.png) 
+
+There appears to be a higher peak of activity (230.4 steps) in weekday mid-mornings, at 8:35, while the weekend peak is lower (166.6 steps) and occurs later, at 9:15. However, the weekend pattern shows more consistent activity in the afternoon hours, with 83.87 mean weekend afternoon activity but only 39.8 mean afternoon activity on weekdays. Indeed, there is a higher mean level of activity on the weekend: 42.37 steps compared to the weekday mean of 35.61 steps, the values of which are plotted.
