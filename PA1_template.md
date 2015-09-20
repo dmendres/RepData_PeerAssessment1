@@ -1,17 +1,9 @@
----
-title: "Reproducible Research: Peer Assessment 1"
-output: 
-  html_document:
-    keep_md: true
----
-```{r setup, echo=FALSE}
-library(knitr)
-opts_chunk$set(fig.path = "./figures/") # corrected path and added dev
+# Reproducible Research: Peer Assessment 1
 
-```
 ## Loading and preprocessing the data
 
-```{r loading, cache=TRUE}
+
+```r
 # Course repdata-032.
 # ASSUMES That we are executing this in the context of the GIT repository local clone, 
 # so there is no need to change directories
@@ -30,7 +22,8 @@ dfActivity$date = as.POSIXct(strptime(dfActivity$date, format = "%Y-%m-%d"))
 
 
 ## What is mean total number of steps taken per day?
-```{r meanSteps}
+
+```r
 #part 1: examine totals by day
 #part 1 instruction explicitly states to ignore NAs
 
@@ -49,10 +42,13 @@ abline(v = meanStepsByDay, col = "orange", lwd = 5)
 abline(v = medianStepsByDay, col = "darkRed")
 ```
 
-The mean value of steps per day is `r meanStepsByDayStr` and median value of steps per day is `r medianStepsByDay`.
+![](./figures/meanSteps-1.png) 
+
+The mean value of steps per day is 10766.2 and median value of steps per day is 10765.
 
 ## What is the average daily activity pattern?
-```{r, activityPatternByInterval}
+
+```r
 #part 2: average daily activity pattern
 dfActivityStepsByInterval = aggregate(dfActivity$steps, by = list(dfActivity$interval), mean, na.rm = T)
 colnames(dfActivityStepsByInterval) = c("interval", "steps")
@@ -60,6 +56,11 @@ colnames(dfActivityStepsByInterval) = c("interval", "steps")
 dfActivityStepsByInterval$hour =  floor(dfActivityStepsByInterval$interval/100) + dfActivityStepsByInterval$interval%%100/60
 plot(dfActivityStepsByInterval$steps ~ dfActivityStepsByInterval$hour, type = "l", col = "darkBlue",
      xlab = "Time of activity(24 hour clock)", ylab = "Average (over days) number of steps per interval", main = "Average number of steps for each 5 min. interval")
+```
+
+![](./figures/activityPatternByInterval-1.png) 
+
+```r
 maxActivitySteps = signif(dfActivityStepsByInterval[which.max(dfActivityStepsByInterval$steps), "steps"],4)
 maxActivityInterval = dfActivityStepsByInterval[which.max(dfActivityStepsByInterval$steps), "interval"]
 maxActivityClockTime = paste(floor(maxActivityInterval/100),maxActivityInterval%%100,sep=":")
@@ -69,11 +70,12 @@ maxStepsClockTime = paste(floor(maxStepsInterval/100),maxStepsInterval%%100,sep=
 maxStepsDate = dfActivity[which.max(dfActivity$steps), "date"]
 maxStepsDay = weekdays(maxStepsDate)
 ```
-5 minute interval of maximum avarage activity (`r maxActivitySteps` steps) occurs at `r maxActivityClockTime`.
-Interestingly, the overall maximum number of steps is `r maxStepsAllIntervals` which occurs at `r maxStepsClockTime` on `r maxStepsDate`, which is a `r maxStepsDay`.
+5 minute interval of maximum avarage activity (206.2 steps) occurs at 8:35.
+Interestingly, the overall maximum number of steps is 806 which occurs at 6:15 on 2012-11-27, which is a Tuesday.
 
 ## Imputing missing values
-```{r, imputeMissing}
+
+```r
 #part 3: impute missing values
 #let's count them
 naIndicator = is.na(dfActivity$steps)
@@ -81,9 +83,10 @@ meanNaIndicator = signif(mean(naIndicator),2)
 sumNaIndicator = sum(naIndicator)
 ```
 
-The fraction of missing values is `r meanNaIndicator` and there are `r sumNaIndicator` missing values.
+The fraction of missing values is 0.13 and there are 2304 missing values.
 
-```{r, moreImputing}
+
+```r
 dfActivityMergeIntervalAvgs <- merge(dfActivity, dfActivityStepsByInterval,by = "interval")
 dfActivityMergeIntervalAvgs$steps <- 
   ifelse(is.na(dfActivityMergeIntervalAvgs$steps.x), 
@@ -120,11 +123,12 @@ cleanMedianSteps0ByDay = median(dfCleanActivitySteps0ByDay$steps0, na.rm = T)
 cleanMedianSteps0ByDayStr = paste(signif(cleanMedianSteps0ByDay,6))
 ```
 
-We impute the NA values in two ways. First by substituting the mean value of steps in the given interval from the mean for that interval on all other days (NAs excluded). With this approach, the mean daily steps is `r cleanMeanStepsByDayStr` and the median of daily steps is `r cleanMedianStepsByDayStr` in the cleaned data. 
+We impute the NA values in two ways. First by substituting the mean value of steps in the given interval from the mean for that interval on all other days (NAs excluded). With this approach, the mean daily steps is 10766.2 and the median of daily steps is 10766.2 in the cleaned data. 
 
-The second approach is to replace NA values with 0. Using 0-replacement, we find the mean for daily steps is reduced to `r cleanMeanSteps0ByDayStr` and the median to `r cleanMedianSteps0ByDayStr` in the cleaned data.
+The second approach is to replace NA values with 0. Using 0-replacement, we find the mean for daily steps is reduced to 9354.23 and the median to 10395 in the cleaned data.
 
-```{r plotClean}
+
+```r
 #plot them side-by-side
 par("mfrow" = c(1,3))
 hist(dfActivityStepsByDay$steps, breaks = 20, col = "lightBlue", plot = T, ylim = c(0,20),
@@ -138,12 +142,15 @@ hist(dfCleanActivitySteps0ByDay$steps0, breaks = 20, col = "lightBlue", plot = T
 abline(v = cleanMeanSteps0ByDay, col = "darkRed")
 ```
 
-As can be seen, there are more days reported in the 10000 step bin when we impute from interval means, but the mean number of steps per day is unchanged little from `r meanStepsByDayStr` to `r cleanMeanStepsByDayStr` in the cleaned data. The median steps per day are little changed, from `r medianStepsByDay` to `r cleanMedianStepsByDayStr` for the interval-mean imputed data.
+![](./figures/plotClean-1.png) 
 
-When we use 0-replacement for NA values, we get a noticably different mean steps value of `r cleanMeanSteps0ByDayStr` and a median of `r cleanMedianSteps0ByDayStr`. In this case, it appears that all of the additional 10000 step days now fall into 0-step days. This appears to be a systematic pattern of NA values and invites further investigation.
+As can be seen, there are more days reported in the 10000 step bin when we impute from interval means, but the mean number of steps per day is unchanged little from 10766.2 to 10766.2 in the cleaned data. The median steps per day are little changed, from 10765 to 10766.2 for the interval-mean imputed data.
+
+When we use 0-replacement for NA values, we get a noticably different mean steps value of 9354.23 and a median of 10395. In this case, it appears that all of the additional 10000 step days now fall into 0-step days. This appears to be a systematic pattern of NA values and invites further investigation.
 
 ## Are there differences in activity patterns between weekdays and weekends?
-```{r weekdayWeekendPatterns}
+
+```r
 dfCleanActivity$weekdays <- ifelse(weekdays(dfCleanActivity$date) %in% c("Saturday", "Sunday"), "weekend", "weekday")
 dfCleanActivity$weekdays <- factor(dfCleanActivity$weekdays)
 library(ggplot2)
@@ -152,7 +159,11 @@ q <- qplot(interval, steps, data = dfCleanActivity, stat = "summary", geom = "li
            xlab = "Time of interval (24 hour clock)", ylab = "Average steps per interval",
            main = "Comparison of weekday and weekend activity")
 print(q)
+```
 
+![](./figures/weekdayWeekendPatterns-1.png) 
+
+```r
 dfWeekActivity = split(dfCleanActivity, dfCleanActivity$weekdays)
 dfWeekdayActivityByInterval = aggregate(dfWeekActivity[[1]]$steps, 
                                         by = list(dfWeekActivity[[1]]$interval), mean)
@@ -187,4 +198,4 @@ meanWeekendPmSteps =
                               "steps"]),4)
 meanWeekendActivity = signif(mean(dfWeekendActivityByInterval[,"steps"]),4)
 ```
-There appears to be a higher peak of activity (`r maxWeekdayActivitySteps` steps) in weekday mid-mornings, at `r maxWeekdayActivityIntervalTime`, while the weekend peak is lower (`r maxWeekendActivitySteps` steps) and occurs later, at `r maxWeekendActivityIntervalTime`. However, the weekend pattern shows more consistent activity in the afternoon hours, with `r meanWeekendPmSteps` mean weekend afternoon activity but only `r meanWeekdayPmSteps` mean afternoon activity on weekdays. Indeed, there is a higher mean level of activity on the weekend: `r meanWeekendActivity` steps compared to the weekday mean of `r meanWeekdayActivity` steps.
+There appears to be a higher peak of activity (230.4 steps) in weekday mid-mornings, at 8:35, while the weekend peak is lower (166.6 steps) and occurs later, at 9:15. However, the weekend pattern shows more consistent activity in the afternoon hours, with 83.87 mean weekend afternoon activity but only 39.8 mean afternoon activity on weekdays. Indeed, there is a higher mean level of activity on the weekend: 42.37 steps compared to the weekday mean of 35.61 steps.
