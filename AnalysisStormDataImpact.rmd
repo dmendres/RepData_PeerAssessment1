@@ -1,0 +1,4202 @@
+---
+title: "Analysis of storm data impact on health and property"
+author: "dmendres"
+date: "September 21, 2015"
+output: 
+  html_document:
+    keep_md: true
+    toc: true
+    toc_depth: 2
+---
+# Introduction
+
+This document has been produced with the knitr package. The session information at the time the document was created is reported below.
+
+```{r setup}
+library(knitr)
+opts_chunk$set(fig.path = "./figures/") # corrected path
+library(data.table)
+library(hash)
+
+sessionInfo()
+```
+# Synopsis
+In this document we examine the impact on population health (injuries and fatalities) and economic consequencdes (property damange and crop damage) of over 900,000 reported storm events from 1950 through 2011 using data from the US National Weather Service. Processing consisted of removing trivial observations were removed, dates and numeric quantities converted, but the bulk of processing consisted of mapping the many variations of weather event type to a canonical set of 48. The observations were grouped by event type for global analysis and by state for regional analysis.
+
+The analysis shows that tornados are the main cause of both injury and death from weather events. However, heat (combined Heat and Excessive Heat events) have an important impact, especially as causes of fatalities. For property loss, it is clear that floods have the greatest impact, but hurricanes, tornados and storm surge are notable as well. It is not surprising that wide-spread events such as draught and floods are the highest impact weather events causing crop damage.
+
+See the summary plots, in the "Worst Event Types" section.
+
+The events are analyzed and ranked for total impact for each state. Readers interested in individual state impacts are urged to use the table of contents to locate their state or territory.
+
+# Data Processing
+## Data Loading
+
+```{r dataLoad, cache = TRUE}
+#```{r dataLoad}
+
+#setwd("C:\\Users\\DavidMack\\Documents\\Coursera\\RDevelopmentWork\\data")
+dtStormData = data.table(read.csv("repdata-data-StormData.csv.bz2", header = T, na.strings = c(""," ")))
+numRows = dim(dtStormData)[1]
+numCols = dim(dtStormData)[2]
+
+#remove trivial entries (we are interested only in non-0 impact on health or property)
+dtStormData = dtStormData[FATALITIES > 0 | INJURIES > 0 | PROPDMG > 0 | CROPDMG > 0,]
+numRowsAfter = dim(dtStormData)[1]
+dtStormData = dtStormData[,BGN_DATE := as.POSIXct(BGN_DATE,format = "%m/%d/%Y %T")]
+
+```
+The storm reporting data was loaded directly to a data.table directly from the csv bzip format. Data.table is used for compactness and performance, given that it contains `r numRows` observations of `r numCols` variables.
+By eliminating trivial observations (those with no human or property impact) we reduce the data to `r numRowsAfter` observations.
+To further reduce the memory footprint, the BGN_DATE column has been converted to a POSIXct date class.
+
+## Data Transformation
+
+### Transformation of Damage Estimates
+
+```{r damageEstimateProcessing}
+
+summary(dtStormData$PROPDMGEXP)
+propExp = levels(dtStormData$PROPDMGEXP)
+#hand coded magic indices, by observation of propExp.
+nonStdPropExp = propExp[c(1:12,14,15)]
+#summary(dtStormData[PROPDMGEXP %in% nonStdPropExp, .(PROPDMG, PROPDMGEXP)])
+dtStormData[,(propDmgSum = sum(PROPDMG)), by = .(PROPDMGEXP)]
+
+#What is the impact of the NAs?
+sumPropDmgNaExp = dtStormData[is.na(PROPDMGEXP) & PROPDMG > 0,sum(PROPDMG)]
+
+#do the same for crop damage
+summary(dtStormData$CROPDMGEXP)
+cropExp = levels(dtStormData$CROPDMGEXP)
+nonStdCropExp = cropExp[1:3]
+dtStormData[,(cropDmgSum = sum(CROPDMG)), by = .(CROPDMGEXP)]
+sumCropDmgNaExp = dtStormData[is.na(CROPDMGEXP) & CROPDMG > 0,sum(CROPDMG)]
+```
+The format for the dollar valued damage observations consists of two fields, a numeric value rounded to three significant digits, followed by an alphabetical character which signifies the magnitude of the number. The National Weather Service instructions describe These magnitude signifiers are "B" for billion, "M" for million, and "K" for thousand. However in addition to lower case designators "m" and "k", other values have been used: `r nonStdPropExp` for property damage and `r nonStdCropExp`. I have made the following assumptions regarding these non-standard exponent codes:
+
+* "h" and "H" are will be considered to signify a multiplier of 100
+* numeric exponent values will be treated as powers of 10. 
+   There might be some concern with the two non-trivial occurrances of exponent "7". Analysis shows that this corresponds to one reported flash flood (damage $680M) and a thunderstorm wind event (damage $140M). These values are at the margin of plausibility. However, a recent event on Memorial Day, 2015, in Hays County, TX caused serious loss of life and can be expected to have a comparable final damage total from all souces.
+
+* NA exponent values will be ignored (effectively treated as 0) if the damage value is non-zero, it will not be further scaled; there are `r sumPropDmgNaExp` dollars of property damage and `r sumCropDmgNaExp` dollars of crop damage if the corresponding NA exponent is treated as 0.
+
+* "+" and "-" values will be ignored (effectively treated as 0) if the damage value is non-zero.
+
+
+```{r damageExponentProcessing}
+allExp = unique(c(propExp,cropExp))
+#This is the mapping described used for exponent values
+# "-" "?" "+" "0" "1" "2" "3" "4" "5" "6" "7" "8" "B" "h" "H" "K" "m" "M" "k"
+# 0   0   0   0   1   2   3   4   5   6   7   8   9   2   2   3   6   6   3
+dtStormData$intPropExp = 
+  sapply(chartr(paste(allExp,collapse=''),"0000123456789223663", dtStormData$PROPDMGEXP), 
+        as.integer)
+dtStormData$intPropExp[is.na(dtStormData$intPropExp)] = 0
+dtStormData$numericPropDamage = dtStormData$PROPDMG * 10.0^dtStormData$intPropExp
+
+dtStormData$intCropExp = 
+  sapply(chartr(paste(allExp,collapse=''),"0000123456789223663", dtStormData$CROPDMGEXP), 
+        as.integer)
+dtStormData$intCropExp[is.na(dtStormData$intCropExp)] = 0
+dtStormData$numericCropDamage = dtStormData$CROPDMG * 10.0^dtStormData$intCropExp
+```
+
+### Transformation of Weather Event Types
+
+```{r eventTypeProcessing}
+
+numUniqueEventCodes = length(unique(dtStormData$EVTYPE))
+#get the individual levels, in preparation for mapping
+evTypes = unique(dtStormData$EVTYPE)
+originalEvTypes = evTypes
+thunderStormEventCodes = 
+  grep("T.*(N|D).*(TORM|TROM|SORM)|TSTM",evTypes, value = T, ignore.case = T)
+numThunderStormEventCodes = length(thunderStormEventCodes)
+```
+The event type encoding is even noisier. Out of `r numUniqueEventCodes` unique event codes with non-trivial impact, there are `r numThunderStormEventCodes`, thunder storm codes, for example, many with misspellings. Our strategy is to review the event types and then to generate a list of event types for each "canonical" event type from the NWS publication 10-1605. We build a hash which maps the raw types to the canonical event type. Then a new column is added to the storm data.table providing the canonical type for each observation. We exclude a number of residual, mainly marine, event types which don't appear to correspond to any of the modern (2007) event types. 
+
+```{r eventTypeMappedToCanonicalTypes}
+# so many combinations for winter storm, capture them first:
+#many combinations for winter storm: two of snow, sleet, ice
+winterStormCodes = c(
+  grep("winter storm", evTypes, ignore.case = T, value = T),
+  grep("SNOW FREEZING RAIN", evTypes, ignore.case = T, value = T),
+  grep("SNOW/BLOWING SNOW", evTypes, ignore.case = T, value = T),
+  grep("FREEZING RAIN/SNOW", evTypes, ignore.case = T, value = T),
+  grep("SNOW/FREEZING RAIN", evTypes, ignore.case = T, value = T),
+  grep("SNOW AND ICE", evTypes, ignore.case = T, value = T),
+  grep("SNOW/ICE", evTypes, ignore.case = T, value = T),
+  grep("FALLING SNOW/ICE", evTypes, ignore.case = T, value = T),
+  grep("SLEET/ICE STORM", evTypes, ignore.case = T, value = T),
+  grep("SNOW/ ICE", evTypes, ignore.case = T, value = T),
+  grep("ICE AND SNOW", evTypes, ignore.case = T, value = T),
+  grep("MIXED PRECIP", evTypes, ignore.case = T, value = T),
+  grep("HEAVY MIX", evTypes, ignore.case = T, value = T),
+  grep("HEAVY SNOW/FREEZING RAIN", evTypes, ignore.case = T, value = T) 
+)
+evTypes = setdiff(evTypes,winterStormCodes)
+
+lowTideEventCodes = grep("low tide", evTypes,value = T, ignore.case = T)
+evTypes = setdiff(evTypes,lowTideEventCodes)
+
+avalancheCodes = grep("avala", evTypes, ignore.case = T, value = T)
+evTypes = setdiff(evTypes,avalancheCodes)
+
+blizzardCodes = grep("bliz",evTypes, ignore.case = T, value = T)
+evTypes = setdiff(evTypes,blizzardCodes)
+
+coastalCodes = c(
+  grep("coast",evTypes, ignore.case = T, value = T),
+  grep("beach erosion",evTypes, ignore.case = T, value = T),
+  grep("tide", evTypes, ignore.case = T, value = T)
+)
+evTypes = setdiff(evTypes,coastalCodes)
+
+extremeColdCodes = grep("ex|rec",grep("cold", evTypes, ignore.case = T, value = T), ignore.case = T, value = T)
+extremeColdCodes = c(extremeColdCodes, 
+                     grep("ex",
+                          grep("wind[ ]*chill", evTypes, ignore.case = T, value = T),
+                          ignore.case = T, value = T))
+evTypes = setdiff(evTypes,extremeColdCodes)
+
+coldCodes = c(
+  setdiff( grep("cold", evTypes, ignore.case = T, value = T),extremeColdCodes),
+  grep("LOW TEMPERATURE", evTypes, ignore.case = T, value = T),
+  grep("HYPOTHERMIA", evTypes, ignore.case = T, value = T)
+)
+evTypes = setdiff(evTypes,coldCodes)
+
+debrisCodes = c(
+  grep("debris", evTypes, ignore.case = T, value = T), #empty
+  grep("slide", evTypes, ignore.case = T, value = T),
+  grep("slump", evTypes, ignore.case = T, value = T)
+  )
+evTypes = setdiff(evTypes,debrisCodes)
+
+denseFogCodes = c(
+  grep("dense fog", evTypes, ignore.case = T, value = T),
+  grep("freezing",
+       grep("fog", evTypes, ignore.case = T, value = T),
+       ignore.case = T, value = T, invert = T)
+)
+evTypes = setdiff(evTypes,denseFogCodes)
+
+denseSmokeCodes = grep("dense smoke", evTypes, ignore.case = T, value = T)
+evTypes = setdiff(evTypes,denseSmokeCodes)
+
+droughtCodes = grep("drought",  evTypes, ignore.case = T, value = T)
+evTypes = setdiff(evTypes,droughtCodes)
+
+dustDevilCodes = grep("devil", evTypes, ignore.case = T, value = T)
+dustDevilCodes = c(dustDevilCodes,grep("whirlwind", evTypes, ignore.case = T, value = T))
+evTypes = setdiff(evTypes,dustDevilCodes)
+
+dustStormCodes = grep("dust", evTypes, ignore.case = T, value = T)
+evTypes = setdiff(evTypes,dustStormCodes)
+
+excessiveHeatCodes = c(
+  grep("ex|rec",
+       grep("heat",  evTypes, ignore.case = T, value = T),
+       ignore.case = T, value = T),
+  grep("UNSEASONABLY WARM",  evTypes, ignore.case = T, value = T)
+  
+)
+
+evTypes = setdiff(evTypes,excessiveHeatCodes)
+
+heatCodes = c(
+  grep("heat", evTypes, ignore.case = T, value = T),
+  grep("hyperthermia", evTypes, ignore.case = T, value = T),
+  grep("warm weather", evTypes, ignore.case = T, value = T)
+  
+)
+evTypes = setdiff(evTypes,heatCodes)
+
+lakeFloodCodes =  grep("snow",
+                       grep("lake",evTypes, ignore.case = T, value = T),
+                        ignore.case = T, value = T, invert = T)
+evTypes = setdiff(evTypes,lakeFloodCodes)
+
+floodCodes = grep("lake",
+                  grep("coast",
+                       grep("flood", evTypes, ignore.case = T, value = T), 
+                       ignore.case = T, value = T, invert = T), 
+                  ignore.case = T, value = T, invert = T)
+#assume that damage from an ice jam is a flood event, ditto urban and small stream events
+floodCodes = c(floodCodes, 
+               grep("ice jam",evTypes, ignore.case = T, value = T),
+               grep("high water",evTypes, ignore.case = T, value = T),
+               grep("urban",evTypes, value = T, ignore.case = T)) 
+evTypes = setdiff(evTypes,floodCodes)
+
+# per the definition of freezine fog, include glaze
+freezingFogCodes = c(
+  grep("freezing fog", evTypes, ignore.case = T, value = T),
+  grep("glaze", evTypes, ignore.case = T, value = T)
+)
+evTypes = setdiff(evTypes,freezingFogCodes)
+
+flashFloodCodes = c(grep("flash", evTypes, ignore.case = T, value = T),
+                    grep("rapidly rising water", evTypes, ignore.case = T, value = T),
+                     grep("DAM BREAK", evTypes, ignore.case = T, value = T))
+evTypes = setdiff(evTypes,flashFloodCodes)
+
+heavyRainCodes = setdiff(grep("heavy",
+                              grep("rain", evTypes, ignore.case = T, value = T),
+                              ignore.case = T, value = T), 
+                         flashFloodCodes)
+dtStormData[EVTYPE == "EXCESSIVE WETNESS",
+              .(.N,sum(FATALITIES),sum(INJURIES),sum(numericPropDamage),
+               sum(numericCropDamage)), 
+            by = .(EVTYPE)]
+# there is a significant impact of excessive wetness on crops, since the wetness originated in a rainstorm, it is included here
+heavyRainCodes = c(heavyRainCodes, 
+                   grep("HEAVY PRECIPITATION",evTypes, value = T, ignore.case = T),
+                   grep("torrential rain",evTypes, value = T, ignore.case = T),
+                   grep("record rain",evTypes, value = T, ignore.case = T),
+                   grep("hvy rain",evTypes, value = T, ignore.case = T),
+                   grep("excessive rain",evTypes, value = T, ignore.case = T),
+                   grep("excessive wetness",evTypes, value = T, ignore.case = T),
+                   grep("unseasonal rain",evTypes, value = T, ignore.case = T),
+                   grep("heavy shower",evTypes, value = T, ignore.case = T),
+                   grep("rainstorm",evTypes, value = T, ignore.case = T),
+                   "RAIN"
+)
+evTypes = setdiff(evTypes,heavyRainCodes)
+
+surfCodes =  grep("surf", evTypes, ignore.case = T, value = T)
+evTypes = setdiff(evTypes,surfCodes)
+
+
+freezeCodes = c(
+  grep("frost|freeze", evTypes, ignore.case = T, value = T),
+  grep("ic.*road", evTypes, ignore.case = T, value = T),
+  grep("black ice", evTypes, ignore.case = T, value = T)
+)
+evTypes = setdiff(evTypes,freezeCodes)
+
+#include thunderstorm hail in hail events, duh
+# but not marine events
+marineThunderstormWindCodes = grep("marine t", evTypes, ignore.case = T, value = T)
+marineHailCodes = grep("marine hail", evTypes, ignore.case = T, value = T)
+hailCodes = grep("hail", evTypes, ignore.case = T, value = T)
+evTypes = setdiff(evTypes,c(marineHailCodes, hailCodes))
+
+thunderStormEventCodes = c(
+  grep("T.*(N|D).*(TORM|TROM|SORM)|TSTM",evTypes, value = T, ignore.case = T),
+  grep("burst", evTypes, value = T, ignore.case = T),
+  grep("gustnado", evTypes, value = T, ignore.case = T))
+evTypes = setdiff(evTypes,thunderStormEventCodes)
+
+
+
+heavySnowCodes = grep("heavy",
+                      grep("snow", evTypes, ignore.case = T, value = T),
+                      ignore.case = T, value = T)
+heavySnowCodes = c(heavySnowCodes, 
+                   grep("excessive snow", evTypes, ignore.case = T, value = T),
+                   grep("record snow", evTypes, ignore.case = T, value = T))
+evTypes = setdiff(evTypes,heavySnowCodes)
+
+
+marineHighWindCodes = grep("marine high wind", evTypes,ignore.case = T, value = T)
+marineStrongWindCodes = grep("marine strong wind", evTypes,ignore.case = T, value = T)
+evTypes = setdiff(setdiff(evTypes, marineHighWindCodes),marineStrongWindCodes)
+highWindCodes = grep("high",
+                     grep("wind",evTypes,value = T, ignore.case = T),
+                     value = T, ignore.case = T)
+evTypes = setdiff(evTypes, highWindCodes)
+
+stormSurgeEventCodes = grep("surge", evTypes,value = T, ignore.case = T)
+evTypes = setdiff(evTypes,stormSurgeEventCodes)
+
+tornadoEventCodes = grep("torn", evTypes, ignore.case = T, value = T)
+tornadoEventCodes = c(tornadoEventCodes, grep("landspout", evTypes, ignore.case = T, value = T))
+evTypes = setdiff(evTypes,tornadoEventCodes)
+
+funnelEventCodes = grep("funnel", evTypes, ignore.case = T, value = T)
+evTypes = setdiff(evTypes,funnelEventCodes)
+
+hurricaneCodes = grep("hurr|typh", evTypes, ignore.case = T, value = T)
+evTypes = setdiff(evTypes, hurricaneCodes)
+
+
+lakeEffectCodes = grep("effect", evTypes, ignore.case = T, value = T)
+evTypes = setdiff(evTypes,lakeEffectCodes)
+
+lightningCodes = grep("lignt|lightn|lighting", evTypes, ignore.case = T, value = T)
+evTypes = setdiff(evTypes, lightningCodes)
+
+ripCodes = grep("rip", evTypes, ignore.case = T, value = T)
+evTypes =setdiff(evTypes, ripCodes)
+
+seicheCodes = grep("seiche", evTypes, ignore.case = T, value = T)
+evTypes = setdiff(evTypes, seicheCodes)
+
+sleetCodes = grep("sleet", evTypes, ignore.case = T, value = T)
+evTypes = setdiff(evTypes, sleetCodes)
+
+strongWindCodes = grep("strong", evTypes, ignore.case = T, value = T)
+#assign all other wind events to strong winds, as they are not characterized as high
+strongWindCodes = c(strongWindCodes, 
+                    grep("wave",
+                         grep("wind",evTypes, value = T, ignore.case = T),
+                         ignore.case = T, value = T, invert = T))
+evTypes = setdiff(evTypes, strongWindCodes)
+
+tropicalDepressionCodes = grep("tropical depression", evTypes, ignore.case = T, value = T)
+evTypes = setdiff(evTypes,tropicalDepressionCodes)
+
+tropicalStormCodes = grep("tropical storm", evTypes, ignore.case = T, value = T)
+evTypes = setdiff(evTypes,tropicalStormCodes)
+
+tsunamiCodes = grep("tsu", evTypes, ignore.case = T, value = T)
+evTypes = setdiff(evTypes,tsunamiCodes)
+
+volcanicAshCodes = grep("volcan", evTypes, ignore.case = T, value = T)
+evTypes = setdiff(evTypes,volcanicAshCodes)
+
+waterSpoutCodes = grep("spout",
+                       grep("water", evTypes, ignore.case = T, value = T),
+                       ignore.case = T, value = T)
+evTypes = setdiff(evTypes,waterSpoutCodes)
+
+wildfireCodes = c(
+  grep("wild", evTypes, ignore.case = T, value = T),
+  grep("brush fire", evTypes, ignore.case = T, value = T),
+  grep("grass fire", evTypes, ignore.case = T, value = T),
+  grep("forest fire", evTypes, ignore.case = T, value = T)
+)
+evTypes = setdiff(evTypes,wildfireCodes)
+
+
+# now we can consider ice
+iceCodes = 
+  grep("black|road",
+       grep("jam",
+            grep("ice", evTypes, ignore.case = T, value = T),
+            ignore.case = T, value = T, invert = T),
+       ignore.case = T, value = T, invert = T)
+evTypes = setdiff(evTypes,iceCodes)
+
+winterWeatherCodes = c(grep("winter weather", evTypes, ignore.case = T, value = T), 
+                       grep("wintry mix", evTypes, ignore.case = T, value = T),
+                       grep("snow", evTypes, ignore.case = T, value = T),
+                       grep("freez", evTypes, ignore.case = T, value = T))
+evTypes = setdiff(evTypes,winterWeatherCodes)
+```
+What is the impact of the codes which remain unmapped?
+```{r impactOfRemainingCodes}
+dtStormUnmapped = dtStormData[EVTYPE %in% evTypes,
+             .("Count" = .N, "TotalFatalities" = sum(FATALITIES),
+               "TotalInjuries" = sum(INJURIES),
+               "TotalPropDmg" = sum(numericPropDamage),
+               "TotalCropDmg" = sum(numericCropDamage)), 
+             by = .(EVTYPE)]
+modernEvTypes = unique(dtStormData[BGN_DATE > as.POSIXct("1996-01-01"),]$EVTYPE)
+intersect(evTypes, modernEvTypes)
+```
+We see that the majority of the remaining codes pertain to marine events and don't map clearly to one of the 48 categories of storm event identified in NWS 10-1605. Indeed, if we restrict to the "modern" observations of 1996 _et seq._, we see that none of these remaining, mainly marine, events appear in the intersection.
+
+A hash is used to realize the mapping of the raw event codes to canonical values.
+```{r mapToCanonicalEventCodes}
+# initialize the hash
+
+hCodeToEvent = hash(winterStormCodes, "Winter Storm")
+hCodeToEvent[lowTideEventCodes] = "Astronomical Low Tide"
+hCodeToEvent[avalancheCodes] = "Avalanche"
+hCodeToEvent[blizzardCodes] = "Blizzard"
+hCodeToEvent[coastalCodes] = "Coastal Flood"
+hCodeToEvent[coldCodes] = "Cold/Wind Chill"
+hCodeToEvent[debrisCodes] = "Debris Flow"
+hCodeToEvent[denseFogCodes] = "Dense Fog"
+hCodeToEvent[denseSmokeCodes] = "Dense Smoke"
+hCodeToEvent[droughtCodes] = "Drought"
+hCodeToEvent[dustDevilCodes] = "Dust Devil"
+hCodeToEvent[dustStormCodes] = "Dust Storm"
+hCodeToEvent[excessiveHeatCodes] = "Excessive Heat"
+hCodeToEvent[extremeColdCodes] = "Extreme Cold/Wind Chill"
+hCodeToEvent[flashFloodCodes] = "Flash Flood"
+hCodeToEvent[floodCodes] = "Flood"
+hCodeToEvent[freezeCodes] = "Frost/Freeze"
+hCodeToEvent[funnelEventCodes] = "Funnel Cloud"
+hCodeToEvent[freezingFogCodes] = "Freezing Fog"
+hCodeToEvent[hailCodes] = "Hail"
+hCodeToEvent[heatCodes] = "Heat"
+hCodeToEvent[heavyRainCodes] = "Heavy Rain"
+hCodeToEvent[heavySnowCodes] = "Heavy Snow"
+hCodeToEvent[surfCodes] = "High Surf"
+hCodeToEvent[highWindCodes] = "High Wind"
+hCodeToEvent[hurricaneCodes] = "Hurricane" #abbreviated from "Hurricane (Typhoon)"
+hCodeToEvent[iceCodes] = "Ice Storm"
+hCodeToEvent[lakeEffectCodes] = "Lake-Effect Snow"
+hCodeToEvent[lakeFloodCodes] = "Lakeshore Flood"
+hCodeToEvent[lightningCodes] = "Lightning"
+hCodeToEvent[marineHailCodes] = "Marine Hail"
+hCodeToEvent[marineHighWindCodes] = "Marine High Wind"
+hCodeToEvent[marineStrongWindCodes] = "Marine Strong Wind"
+hCodeToEvent[marineThunderstormWindCodes] = "Marine Thunderstorm Wind"
+hCodeToEvent[ripCodes] = "Rip Current"
+hCodeToEvent[seicheCodes] = "Seiche"
+hCodeToEvent[sleetCodes] = "Sleet"
+hCodeToEvent[stormSurgeEventCodes] = "Storm Surge/Tide"
+hCodeToEvent[strongWindCodes] = "Strong Wind"
+hCodeToEvent[thunderStormEventCodes] = "Thunderstorm Wind"
+hCodeToEvent[tornadoEventCodes] = "Tornado"
+hCodeToEvent[tropicalDepressionCodes] = "Tropical Depression"
+hCodeToEvent[tropicalStormCodes] = "Tropical Storm"
+hCodeToEvent[tsunamiCodes] = "Tsunami"
+hCodeToEvent[volcanicAshCodes] = "Volcanic Ash"
+hCodeToEvent[waterSpoutCodes] = "Waterspout"
+hCodeToEvent[wildfireCodes] = "Wildfire"
+#hCodeToEvent[] = "Winter Storm" # processed above
+hCodeToEvent[winterWeatherCodes] = "Winter Weather"
+# null the rows for the unmapped EVTYPE values, as discussed above, they don't correspond to "modern" observations since 1996.
+#hCodeToEvent[evTypes] = evTypes
+dtStormData = dtStormData[!(EVTYPE %in% evTypes),]
+#and here is the column of "canonical" Event Types
+dtStormData$canonicalEventCode = 
+  sapply(dtStormData$EVTYPE, 
+         function (code) {values(hCodeToEvent[code])[1]}
+         )
+# make it a factor
+dtStormData$canonicalEventCode = factor(dtStormData$canonicalEventCode)
+# Examine the result
+table(dtStormData$canonicalEventCode)
+
+```
+
+# Results
+
+## Worst Event Types
+
+What and where were the maximal impacts on human health?
+
+```{r analysisOfHumanHealthImpacts}
+worstFatalityEvent = dtStormData[which.max(FATALITIES),.("DATE"=BGN_DATE,STATE,canonicalEventCode,FATALITIES)]
+worstInjuryEvent = dtStormData[which.max(INJURIES),.("DATE"=BGN_DATE,STATE,canonicalEventCode,INJURIES)]
+```
+
+The worst single fatality damage event occured on `r worstFatalityEvent$DATE` in `r worstFatalityEvent$STATE` due to `r worstFatalityEvent$canonicalEventCode`.
+The worst single injury event occured on `r worstInjuryEvent$DATE` in `r worstInjuryEvent$STATE` due to `r worstInjuryEvent$canonicalEventCode`.
+
+What and where were the maximal impact events on property and crops?
+
+```{r analysisOfEconomicImpacts}
+worstPropDmg = dtStormData[which.max(numericPropDamage),.("DATE"=BGN_DATE,STATE,canonicalEventCode,numericPropDamage)]
+worstCropDmg = dtStormData[which.max(numericCropDamage),.("DATE"=BGN_DATE,STATE,canonicalEventCode,numericCropDamage)]
+```
+The worst property damage occured on `r worstPropDmg$DATE` in `r worstPropDmg$STATE` due to `r worstPropDmg$canonicalEventCode` and cost `r worstPropDmg$numericPropDamage` dollars.
+The worst crop damage occured on `r worstCropDmg$DATE` in `r worstCropDmg$STATE` due to `r worstCropDmg$canonicalEventCode` and cost `r worstCropDmg$numericCropDamage` dollars.
+
+The following plot shows the top event types by their impact, respectively, on injury and fatalities.
+```{r summaryAllStates}
+require(reshape2)
+require(ggplot2)
+
+dtStormsByType = dtStormData[,
+                             .(.N,sum(FATALITIES),sum(INJURIES),
+                               sum(numericPropDamage)/10^6,
+                                sum(numericCropDamage)/10^6), 
+                             by = .(canonicalEventCode)]
+setnames(dtStormsByType,
+         colnames(dtStormsByType),
+         c("CanonicalType", "Count", 
+           "TotalFatal", "TotalInjury", "TotalPropDmg", "TotalCropDmg"))
+
+dt1 = dtStormsByType[TotalFatal>0,.(CanonicalType,TotalFatal)][order(-TotalFatal),]
+dt2 = dtStormsByType[TotalInjury>0,.(CanonicalType,TotalInjury)][order(-TotalInjury),]
+
+dt12 = merge(dt1,dt2,by = c("CanonicalType"))
+dt12 = dt12[order(-dt12$TotalInjury)]
+#order Event types by decreasing total injury, fatalities closely follow
+dt12$CanonicalType = reorder(dt12$CanonicalType,-rank(dt12$TotalInjury))
+#melt to one tidy table
+meltedDt12 = melt(dt12,id.vars = "CanonicalType")
+
+#plot (with thanks to StackOverflow for many formatting hints!)
+ifPlot = ggplot(meltedDt12,aes(x=CanonicalType,y = value, fill = variable)) 
+ifPlot = ifPlot + scale_fill_manual(values = c("darkRed", "pink"))
+ifPlot = ifPlot + geom_bar(stat = "identity") 
+ifPlot = ifPlot + theme(axis.text.x = element_text(angle = 90, hjust = 1))
+ifPlot = ifPlot + labs(title = "Ordered Injury and Fatality Events", 
+                       x = "Event Type", 
+                       y = "Injury & Fatality Count")
+print(ifPlot)
+```
+The following plot shows the top 20 events for property and crop damage across all states.
+```{r summaryDamageAllStates}
+dt3 = dtStormsByType[TotalPropDmg>0,.(CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+setnames(dt3,colnames(dt3), c("CanonicalType", "TotalPropDmg"))
+dt4 = dtStormsByType[TotalCropDmg>0,.(CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+setnames(dt4,colnames(dt4), c("CanonicalType", "TotalCropDmg"))
+
+dt34 = merge(dt3, dt4,by = c("CanonicalType"))
+dt34$CanonicalType = reorder(dt34$CanonicalType,-rank(dt34$TotalPropDmg))
+meltedDt34 = melt(dt34, id.vars = "CanonicalType")
+
+pcPlot = ggplot(meltedDt34,aes(x=CanonicalType,y = value, fill = variable)) 
+pcPlot = pcPlot + scale_fill_manual(values = c("tan", "lightGreen", "pink"))
+pcPlot = pcPlot + geom_bar(stat = "identity") 
+pcPlot = pcPlot + theme(axis.text.x = element_text(angle = 90, hjust = 1))
+pcPlot = pcPlot + labs(title = "Ordered Property and Crop Loss Events",
+                       x = "Event Type", 
+                       y = "Loss ($M)")
+print(pcPlot)
+  
+```
+
+## State-by-state analysis
+The following sets of tables examine the top events for each type of impact by state. For each state and territory, up to 5 events are shown for each of fatalities, injuries, property damage and crop damage. For graphic views, see the appendix:  http://rpubs.com/dmendres/113826.
+
+```{r analysisByState}
+
+dtStormsByState = dtStormData[,
+                              .(.N,sum(FATALITIES),sum(INJURIES),sum(numericPropDamage)/10E6,
+                                sum(numericCropDamage)/10E6), by = .(STATE,canonicalEventCode)]
+setnames(dtStormsByState,colnames(dtStormsByState),
+         c("STATE", "CanonicalType", "Count", 
+           "TotalFatal", "TotalInjury", "TotalPropDmg", "TotalCropDmg"))
+```
+Some processing is required to map the abbreviations to more readable state names, especially for the non-states not already supported in the R _state_ data set.
+```{r setStateNames}
+library(datasets)
+
+dfAbb2State = data.frame("STATE" = state.abb, "StateName" = state.name)
+
+nonStateAbb = setdiff(unique(dtStormsByState$STATE),state.abb)
+nonStateName = c("District of Columbia", "Puerto Rico", "American Samoa", "Guam", "Marshall Islands", "Virgin Islands", "Gulf of Mexico", "Atlantic Ocean", "Lake Michigan", "St Lawrence River", "Lake Ontario", "Tropical Atlantic and Caribbean Sea", "Lake Erie", "Alaska Waters", "Pacific Ocean", "Lake Superior", "Hawaii Off Shore")
+dfAbb2State = rbind(dfAbb2State,data.frame("STATE" = nonStateAbb, "StateName" = nonStateName))
+dtAbb2State = data.table(dfAbb2State)
+dtStormsByState= merge(dtStormsByState, dtAbb2State, by = c("STATE"))
+rm("dfAbb2State")
+detach("package:datasets")
+```
+
+```{r prepareStateAnalysis}
+stormsByState = split(dtStormsByState, dtStormsByState$STATE, drop = T)
+#We use make 67 sub-sections, one for each state and territory to accommodate null entries
+#code created using emacs macros
+```
+
+
+```{r setupForStateAL}
+nextStateName = dtAbb2State[STATE == "AL",.(StateName)][[1]]
+dt = stormsByState[["AL"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateAL}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateAL}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateAL}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateAL}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateAK}
+nextStateName = dtAbb2State[STATE == "AK",.(StateName)][[1]]
+dt = stormsByState[["AK"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateAK}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateAK}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateAK}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateAK}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateAR}
+nextStateName = dtAbb2State[STATE == "AR",.(StateName)][[1]]
+dt = stormsByState[["AR"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateAR}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateAR}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateAR}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateAR}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateAZ}
+nextStateName = dtAbb2State[STATE == "AZ",.(StateName)][[1]]
+dt = stormsByState[["AZ"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateAZ}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateAZ}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateAZ}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateAZ}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+
+```{r setupForStateCA}
+nextStateName = dtAbb2State[STATE == "CA",.(StateName)][[1]]
+dt = stormsByState[["CA"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateCA}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateCA}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateCA}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateCA}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateCO}
+nextStateName = dtAbb2State[STATE == "CO",.(StateName)][[1]]
+dt = stormsByState[["CO"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateCO}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateCO}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateCO}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateCO}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateCT}
+nextStateName = dtAbb2State[STATE == "CT",.(StateName)][[1]]
+dt = stormsByState[["CT"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateCT}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateCT}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateCT}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateCT}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateDE}
+nextStateName = dtAbb2State[STATE == "DE",.(StateName)][[1]]
+dt = stormsByState[["DE"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateDE}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateDE}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateDE}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateDE}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateFL}
+nextStateName = dtAbb2State[STATE == "FL",.(StateName)][[1]]
+dt = stormsByState[["FL"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateFL}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateFL}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateFL}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateFL}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateGA}
+nextStateName = dtAbb2State[STATE == "GA",.(StateName)][[1]]
+dt = stormsByState[["GA"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateGA}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateGA}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateGA}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateGA}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateHI}
+nextStateName = dtAbb2State[STATE == "HI",.(StateName)][[1]]
+dt = stormsByState[["HI"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateHI}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateHI}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateHI}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateHI}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateID}
+nextStateName = dtAbb2State[STATE == "ID",.(StateName)][[1]]
+dt = stormsByState[["ID"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateID}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateID}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateID}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateID}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateIL}
+nextStateName = dtAbb2State[STATE == "IL",.(StateName)][[1]]
+dt = stormsByState[["IL"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateIL}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateIL}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateIL}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateIL}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateIN}
+nextStateName = dtAbb2State[STATE == "IN",.(StateName)][[1]]
+dt = stormsByState[["IN"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateIN}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateIN}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateIN}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateIN}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateIA}
+nextStateName = dtAbb2State[STATE == "IA",.(StateName)][[1]]
+dt = stormsByState[["IA"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateIA}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateIA}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateIA}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateIA}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateKS}
+nextStateName = dtAbb2State[STATE == "KS",.(StateName)][[1]]
+dt = stormsByState[["KS"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateKS}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateKS}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateKS}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateKS}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateKY}
+nextStateName = dtAbb2State[STATE == "KY",.(StateName)][[1]]
+dt = stormsByState[["KY"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateKY}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateKY}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateKY}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateKY}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateLA}
+nextStateName = dtAbb2State[STATE == "LA",.(StateName)][[1]]
+dt = stormsByState[["LA"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateLA}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateLA}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateLA}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateLA}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateME}
+nextStateName = dtAbb2State[STATE == "ME",.(StateName)][[1]]
+dt = stormsByState[["ME"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateME}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateME}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateME}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateME}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateMD}
+nextStateName = dtAbb2State[STATE == "MD",.(StateName)][[1]]
+dt = stormsByState[["MD"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateMD}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateMD}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateMD}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateMD}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateMA}
+nextStateName = dtAbb2State[STATE == "MA",.(StateName)][[1]]
+dt = stormsByState[["MA"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateMA}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateMA}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateMA}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateMA}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateMI}
+nextStateName = dtAbb2State[STATE == "MI",.(StateName)][[1]]
+dt = stormsByState[["MI"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateMI}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateMI}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateMI}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateMI}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateMN}
+nextStateName = dtAbb2State[STATE == "MN",.(StateName)][[1]]
+dt = stormsByState[["MN"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateMN}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateMN}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateMN}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateMN}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateMS}
+nextStateName = dtAbb2State[STATE == "MS",.(StateName)][[1]]
+dt = stormsByState[["MS"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateMS}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateMS}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateMS}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateMS}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateMO}
+nextStateName = dtAbb2State[STATE == "MO",.(StateName)][[1]]
+dt = stormsByState[["MO"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateMO}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateMO}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateMO}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateMO}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateMT}
+nextStateName = dtAbb2State[STATE == "MT",.(StateName)][[1]]
+dt = stormsByState[["MT"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateMT}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateMT}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateMT}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateMT}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateNE}
+nextStateName = dtAbb2State[STATE == "NE",.(StateName)][[1]]
+dt = stormsByState[["NE"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateNE}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateNE}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateNE}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateNE}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateNV}
+nextStateName = dtAbb2State[STATE == "NV",.(StateName)][[1]]
+dt = stormsByState[["NV"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateNV}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateNV}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateNV}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateNV}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateNH}
+nextStateName = dtAbb2State[STATE == "NH",.(StateName)][[1]]
+dt = stormsByState[["NH"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateNH}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateNH}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateNH}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateNH}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateNJ}
+nextStateName = dtAbb2State[STATE == "NJ",.(StateName)][[1]]
+dt = stormsByState[["NJ"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateNJ}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateNJ}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateNJ}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateNJ}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateNM}
+nextStateName = dtAbb2State[STATE == "NM",.(StateName)][[1]]
+dt = stormsByState[["NM"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateNM}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateNM}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateNM}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateNM}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateNY}
+nextStateName = dtAbb2State[STATE == "NY",.(StateName)][[1]]
+dt = stormsByState[["NY"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateNY}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateNY}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateNY}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateNY}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateNC}
+nextStateName = dtAbb2State[STATE == "NC",.(StateName)][[1]]
+dt = stormsByState[["NC"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateNC}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateNC}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateNC}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateNC}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateND}
+nextStateName = dtAbb2State[STATE == "ND",.(StateName)][[1]]
+dt = stormsByState[["ND"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateND}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateND}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateND}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateND}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateOH}
+nextStateName = dtAbb2State[STATE == "OH",.(StateName)][[1]]
+dt = stormsByState[["OH"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateOH}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateOH}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateOH}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateOH}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateOK}
+nextStateName = dtAbb2State[STATE == "OK",.(StateName)][[1]]
+dt = stormsByState[["OK"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateOK}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateOK}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateOK}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateOK}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateOR}
+nextStateName = dtAbb2State[STATE == "OR",.(StateName)][[1]]
+dt = stormsByState[["OR"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateOR}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateOR}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateOR}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateOR}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStatePA}
+nextStateName = dtAbb2State[STATE == "PA",.(StateName)][[1]]
+dt = stormsByState[["PA"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStatePA}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStatePA}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStatePA}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStatePA}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateRI}
+nextStateName = dtAbb2State[STATE == "RI",.(StateName)][[1]]
+dt = stormsByState[["RI"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateRI}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateRI}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateRI}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateRI}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateSC}
+nextStateName = dtAbb2State[STATE == "SC",.(StateName)][[1]]
+dt = stormsByState[["SC"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateSC}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateSC}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateSC}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateSC}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateSD}
+nextStateName = dtAbb2State[STATE == "SD",.(StateName)][[1]]
+dt = stormsByState[["SD"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateSD}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateSD}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateSD}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateSD}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateTN}
+nextStateName = dtAbb2State[STATE == "TN",.(StateName)][[1]]
+dt = stormsByState[["TN"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateTN}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateTN}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateTN}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateTN}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateTX}
+nextStateName = dtAbb2State[STATE == "TX",.(StateName)][[1]]
+dt = stormsByState[["TX"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateTX}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateTX}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateTX}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateTX}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateUT}
+nextStateName = dtAbb2State[STATE == "UT",.(StateName)][[1]]
+dt = stormsByState[["UT"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateUT}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateUT}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateUT}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateUT}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateVT}
+nextStateName = dtAbb2State[STATE == "VT",.(StateName)][[1]]
+dt = stormsByState[["VT"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateVT}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateVT}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateVT}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateVT}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateVA}
+nextStateName = dtAbb2State[STATE == "VA",.(StateName)][[1]]
+dt = stormsByState[["VA"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateVA}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateVA}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateVA}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateVA}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateWA}
+nextStateName = dtAbb2State[STATE == "WA",.(StateName)][[1]]
+dt = stormsByState[["WA"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateWA}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateWA}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateWA}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateWA}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateWV}
+nextStateName = dtAbb2State[STATE == "WV",.(StateName)][[1]]
+dt = stormsByState[["WV"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateWV}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateWV}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateWV}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateWV}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateWI}
+nextStateName = dtAbb2State[STATE == "WI",.(StateName)][[1]]
+dt = stormsByState[["WI"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateWI}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateWI}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateWI}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateWI}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateWY}
+nextStateName = dtAbb2State[STATE == "WY",.(StateName)][[1]]
+dt = stormsByState[["WY"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateWY}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateWY}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateWY}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateWY}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateDC}
+nextStateName = dtAbb2State[STATE == "DC",.(StateName)][[1]]
+dt = stormsByState[["DC"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateDC}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateDC}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateDC}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateDC}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStatePR}
+nextStateName = dtAbb2State[STATE == "PR",.(StateName)][[1]]
+dt = stormsByState[["PR"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStatePR}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStatePR}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStatePR}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStatePR}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateAS}
+nextStateName = dtAbb2State[STATE == "AS",.(StateName)][[1]]
+dt = stormsByState[["AS"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateAS}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateAS}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateAS}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateAS}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateGU}
+nextStateName = dtAbb2State[STATE == "GU",.(StateName)][[1]]
+dt = stormsByState[["GU"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateGU}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateGU}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateGU}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateGU}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateMH}
+nextStateName = dtAbb2State[STATE == "MH",.(StateName)][[1]]
+dt = stormsByState[["MH"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateMH}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateMH}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateMH}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateMH}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateVI}
+nextStateName = dtAbb2State[STATE == "VI",.(StateName)][[1]]
+dt = stormsByState[["VI"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateVI}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateVI}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateVI}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateVI}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateGM}
+nextStateName = dtAbb2State[STATE == "GM",.(StateName)][[1]]
+dt = stormsByState[["GM"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateGM}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateGM}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateGM}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateGM}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateAN}
+nextStateName = dtAbb2State[STATE == "AN",.(StateName)][[1]]
+dt = stormsByState[["AN"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateAN}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateAN}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateAN}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateAN}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateLM}
+nextStateName = dtAbb2State[STATE == "LM",.(StateName)][[1]]
+dt = stormsByState[["LM"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateLM}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateLM}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateLM}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateLM}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateSL}
+nextStateName = dtAbb2State[STATE == "SL",.(StateName)][[1]]
+dt = stormsByState[["SL"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateSL}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateSL}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateSL}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateSL}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateLO}
+nextStateName = dtAbb2State[STATE == "LO",.(StateName)][[1]]
+dt = stormsByState[["LO"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateLO}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateLO}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateLO}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateLO}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateAM}
+nextStateName = dtAbb2State[STATE == "AM",.(StateName)][[1]]
+dt = stormsByState[["AM"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateAM}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateAM}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateAM}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateAM}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateLE}
+nextStateName = dtAbb2State[STATE == "LE",.(StateName)][[1]]
+dt = stormsByState[["LE"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateLE}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateLE}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateLE}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateLE}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStatePK}
+nextStateName = dtAbb2State[STATE == "PK",.(StateName)][[1]]
+dt = stormsByState[["PK"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStatePK}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStatePK}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStatePK}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStatePK}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStatePZ}
+nextStateName = dtAbb2State[STATE == "PZ",.(StateName)][[1]]
+dt = stormsByState[["PZ"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStatePZ}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStatePZ}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStatePZ}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStatePZ}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStateLS}
+nextStateName = dtAbb2State[STATE == "LS",.(StateName)][[1]]
+dt = stormsByState[["LS"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStateLS}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStateLS}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStateLS}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStateLS}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r setupForStatePH}
+nextStateName = dtAbb2State[STATE == "PH",.(StateName)][[1]]
+dt = stormsByState[["PH"]]
+```
+
+##Weather Event Impacts for `r nextStateName`
+```{r kable1ForStatePH}
+if (!is.null(dt)) {
+  dt1 = dt[TotalFatal>0,.(STATE,CanonicalType,TotalFatal)][order(-TotalFatal),]
+  dt1 = dt1[1:10,.(CanonicalType,TotalFatal)]
+  dt1 = dt1[!is.na(CanonicalType),]
+  if(nrow(dt1) > 0) {
+    kable(dt1, row.names = F, 
+          col.names=c("Event Type", "Total Fatalities"),
+          caption = paste("**Top Fataility Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable2ForStatePH}
+if (!is.null(dt)) {
+  dt2 = dt[TotalInjury>0,.(STATE,CanonicalType,TotalInjury)][order(-TotalInjury),]
+  dt2 = dt2[1:10,.(CanonicalType,TotalInjury)]
+  dt2 = dt2[!is.na(CanonicalType),]
+  if(nrow(dt2) > 0) {
+    kable(dt2, row.names = F, 
+          col.names=c("Event Type", "Total Injuries"),
+          caption = paste("**Top Injury Events for",nextStateName,"**"))    
+  }
+}
+```
+```{r kable3ForStatePH}
+if (!is.null(dt)) {
+  dt3 = dt[TotalPropDmg>0,.(STATE,CanonicalType,TotalPropDmg)][order(-TotalPropDmg),]
+  dt3 = dt3[1:10,.(CanonicalType,TotalPropDmg)]
+  dt3 = dt3[!is.na(CanonicalType),]
+  if(nrow(dt3) > 0) {
+    kable(dt3, row.names = F, 
+      col.names=c("Event Type", "Total Property Damage ($M)"),
+      caption = paste("**Top Property Damage Events for",nextStateName,"**"))
+  }
+}
+```
+```{r kable4ForStatePH}
+if (!is.null(dt)) {
+  dt4 = dt[TotalCropDmg>0,.(STATE,CanonicalType,TotalCropDmg)][order(-TotalCropDmg),]
+  dt4 = dt4[1:10,.(CanonicalType,TotalCropDmg)]
+  dt4 = dt4[!is.na(CanonicalType),]
+  if(nrow(dt4) > 0) {
+    kable(dt4, row.names = F, 
+          col.names=c("Event Type", "Total Crop Damage ($M)"),
+          caption = paste("**Top Crop Damage Events for",nextStateName,"**"))
+  }
+}
+```
